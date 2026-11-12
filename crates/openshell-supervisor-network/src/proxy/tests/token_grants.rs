@@ -71,6 +71,7 @@ async fn forward_inspection_selects_only_the_owner_admitting_the_request() {
         let prepared = inject_token_grant_for_forward_request(
             method,
             "/v1/projects",
+            "/v1/projects",
             raw,
             &mut ctx,
             Some(ForwardL7Reevaluation {
@@ -120,6 +121,7 @@ async fn forward_inspection_retains_installation_through_guarded_write() {
     let raw = b"POST http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nContent-Length: 0\r\n\r\n".to_vec();
     let prepared = inject_token_grant_for_forward_request(
         "POST",
+        "/v1/projects",
         "/v1/projects",
         raw,
         &mut ctx,
