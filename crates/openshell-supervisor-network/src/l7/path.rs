@@ -525,6 +525,50 @@ mod tests {
     }
 
     #[test]
+    fn percent_encoded_reserved_bytes_are_forwarded_as_sent() {
+        // Signed requests (AWS SigV4 and similar schemes) sign the exact path
+        // bytes the client sends. AWS REST-JSON APIs carry resource ARNs in a
+        // path segment with `:` and `/` percent-encoded. Policy evaluation may
+        // see the decoded form, but an already-canonical path must reach the
+        // upstream unchanged or the upstream rejects the signature.
+        let opts = CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..CanonicalizeOptions::default()
+        };
+        for target in [
+            "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo",
+            "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aeu-west-2%3A123456789012%3Afunction%3Ademo/policy",
+            "/users/%40alice",
+            "/v1/a%2Bb%3Dc%2Cd%21%24%26%27%28%29%2A",
+        ] {
+            let (canonical, _) = canonicalize_request_target(target, &opts).unwrap();
+            assert!(
+                !canonical.rewritten,
+                "{target} must be forwarded byte-for-byte, policy path {}",
+                canonical.path
+            );
+        }
+    }
+
+    #[test]
+    fn policy_path_decodes_percent_encoded_reserved_bytes() {
+        // Policy rules keep matching the decoded form.
+        let opts = CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..CanonicalizeOptions::default()
+        };
+        assert_eq!(
+            canon_with(
+                "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo",
+                opts
+            )
+            .unwrap(),
+            "/tags/arn:aws:eks:eu-west-2:123456789012:cluster%2Fdemo"
+        );
+        assert_eq!(canon("/v1/a%2Bb%3Dc").unwrap(), "/v1/a+b=c");
+    }
+
+    #[test]
     fn path_parameters_stripped_by_default() {
         assert_eq!(canon("/a;jsessionid=xyz/b").unwrap(), "/a/b");
         assert_eq!(canon("/public;x=1/../secret").unwrap(), "/secret");
