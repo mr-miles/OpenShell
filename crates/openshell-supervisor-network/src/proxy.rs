@@ -14440,6 +14440,27 @@ network_policies:
     }
 
     #[test]
+    fn test_prepare_forward_target_forwards_encoded_reserved_path_bytes_as_sent() {
+        let prepared = prepare_forward_target(
+            "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo?x=1",
+            crate::l7::path::CanonicalizeOptions {
+                allow_encoded_slash: true,
+                ..crate::l7::path::CanonicalizeOptions::default()
+            },
+        )
+        .expect("prepared target");
+        assert_eq!(
+            prepared.canonical_path,
+            "/tags/arn:aws:eks:eu-west-2:123456789012:cluster%2Fdemo"
+        );
+        assert_eq!(
+            prepared.upstream_target,
+            "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo?x=1",
+            "the forwarded target must keep the client's encoding"
+        );
+    }
+
+    #[test]
     fn test_rewrite_resolves_placeholder_auth_headers() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
