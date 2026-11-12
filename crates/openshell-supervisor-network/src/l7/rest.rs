@@ -5844,6 +5844,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_http_request_forwards_encoded_reserved_path_bytes_as_sent() {
+        let options = crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..crate::l7::path::CanonicalizeOptions::default()
+        };
+        for (sent, policy, forwarded) in [
+            // Already canonical: forwarded byte-for-byte, so a signature over
+            // the path (AWS SigV4) still verifies upstream.
+            (
+                "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo",
+                "/tags/arn:aws:eks:eu-west-2:123456789012:cluster%2Fdemo",
+                "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo",
+            ),
+            // Structural canonicalization still rewrites the path, but keeps
+            // the reserved bytes the client encoded.
+            (
+                "/v1/../tags/arn%3Aaws%3Asns%3Aeu-west-2%3A123456789012%3Atopic",
+                "/tags/arn:aws:sns:eu-west-2:123456789012:topic",
+                "/tags/arn%3Aaws%3Asns%3Aeu-west-2%3A123456789012%3Atopic",
+            ),
+        ] {
+            let (mut client, mut writer) = tokio::io::duplex(4096);
+            writer
+                .write_all(
+                    format!("GET {sent}?x=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            let req = parse_http_request(&mut client, &options)
+                .await
+                .expect("request should parse")
+                .expect("request should exist");
+            assert_eq!(req.target, policy);
+            assert_eq!(
+                String::from_utf8_lossy(&req.raw_header),
+                format!("GET {forwarded}?x=1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n"),
+                "outbound request line must keep the client's encoding of {sent}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn parse_http_request_rejects_absolute_authority_mismatched_with_host() {
         let (mut client, mut peer) = tokio::io::duplex(1024);
         peer.write_all(

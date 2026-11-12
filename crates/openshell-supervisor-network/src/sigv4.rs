@@ -582,6 +582,135 @@ mod tests {
         assert!(!result_str.contains("old-date"));
     }
 
+    /// Parse an `x-amz-date` value (`YYYYMMDDTHHMMSSZ`) into a `SystemTime`.
+    fn parse_amz_date(value: &str) -> SystemTime {
+        let field = |range: std::ops::Range<usize>| -> i64 { value[range].parse().unwrap() };
+        let (year, month, day) = (field(0..4), field(4..6), field(6..8));
+        let (hour, minute, second) = (field(9..11), field(11..13), field(13..15));
+        // Days from the civil date (proleptic Gregorian), per H. Hinnant.
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        let days = era * 146_097 + day_of_era - 719_468;
+        let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(seconds).unwrap())
+    }
+
+    fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
+        request
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+            .unwrap_or_else(|| panic!("{name} header missing from {request:?}"))
+    }
+
+    /// The `authorization` header an AWS SDK computes for a body-less `GET`
+    /// carrying only a `Host` header, with the URI encoding settings the SDK
+    /// uses for `service`, at `time`.
+    fn sdk_authorization(
+        path: &str,
+        host: &str,
+        region: &str,
+        service: &str,
+        time: SystemTime,
+        percent_encoding_mode: aws_sigv4::http_request::PercentEncodingMode,
+        uri_path_normalization_mode: aws_sigv4::http_request::UriPathNormalizationMode,
+    ) -> String {
+        let identity = build_identity(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+        );
+        let mut settings = SigningSettings::default();
+        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+        settings.percent_encoding_mode = percent_encoding_mode;
+        settings.uri_path_normalization_mode = uri_path_normalization_mode;
+        let params: aws_sigv4::http_request::SigningParams<'_> = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name(service)
+            .time(time)
+            .settings(settings)
+            .build()
+            .unwrap()
+            .into();
+        let uri = format!("https://{host}{path}");
+        let request = SignableRequest::new(
+            "GET",
+            &uri,
+            [("host", host)].into_iter(),
+            SignableBody::Bytes(&[]),
+        )
+        .unwrap();
+        let (instructions, _) = sign(request, &params).unwrap().into_parts();
+        instructions
+            .headers()
+            .find(|(name, _)| *name == "authorization")
+            .map(|(_, value)| value.to_string())
+            .expect("authorization header")
+    }
+
+    fn supervisor_signed(path: &str, host: &str, region: &str, service: &str) -> String {
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let signed = apply_sigv4_to_request(
+            raw.as_bytes(),
+            host,
+            region,
+            service,
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+        )
+        .unwrap();
+        String::from_utf8(signed).unwrap()
+    }
+
+    #[test]
+    fn s3_requests_sign_the_path_without_double_encoding() {
+        // S3 signs the URI path as sent: single-encoded and not normalized.
+        // Double-encoding turns an object key's `%2F` or `%20` into `%252F`
+        // or `%2520` in the canonical request, and S3 rejects the signature.
+        let host = "my-bucket.s3.eu-west-2.amazonaws.com";
+        for path in ["/folder%2Freport%20final.csv", "/a%3Ab%2Bc%3Dd.txt"] {
+            let signed = supervisor_signed(path, host, "eu-west-2", "s3");
+            let time = parse_amz_date(header_value(&signed, "x-amz-date"));
+            assert_eq!(
+                header_value(&signed, "authorization"),
+                sdk_authorization(
+                    path,
+                    host,
+                    "eu-west-2",
+                    "s3",
+                    time,
+                    aws_sigv4::http_request::PercentEncodingMode::Single,
+                    aws_sigv4::http_request::UriPathNormalizationMode::Disabled,
+                ),
+                "S3 signature for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_s3_requests_keep_double_encoding() {
+        let host = "eks.eu-west-2.amazonaws.com";
+        let path = "/tags/arn%3Aaws%3Aeks%3Aeu-west-2%3A123456789012%3Acluster%2Fdemo";
+        let signed = supervisor_signed(path, host, "eu-west-2", "eks");
+        let time = parse_amz_date(header_value(&signed, "x-amz-date"));
+        assert_eq!(
+            header_value(&signed, "authorization"),
+            sdk_authorization(
+                path,
+                host,
+                "eu-west-2",
+                "eks",
+                time,
+                aws_sigv4::http_request::PercentEncodingMode::Double,
+                aws_sigv4::http_request::UriPathNormalizationMode::Enabled,
+            )
+        );
+    }
+
     #[test]
     fn headers_only_produces_unsigned_payload() {
         let raw = b"PUT /my-bucket/my-key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nContent-Type: application/octet-stream\r\nContent-Length: 1024\r\n\r\n";
