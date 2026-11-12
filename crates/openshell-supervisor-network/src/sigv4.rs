@@ -4,7 +4,8 @@
 use aws_credential_types::Credentials;
 use aws_sigv4::SigningOutput;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningInstructions, SigningSettings, sign,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningInstructions,
+    SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -212,6 +213,13 @@ fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
     }
 }
 
+/// S3 signs the URI path exactly as sent: single-encoded and not
+/// normalized. Every other service signs it double-encoded and normalized,
+/// which is the `aws-sigv4` default. The AWS SDKs apply the same split.
+fn signs_path_as_sent(service: &str) -> bool {
+    matches!(service, "s3" | "s3-object-lambda" | "s3-outposts")
+}
+
 fn build_signing_params<'a>(
     identity: &'a Identity,
     region: &'a str,
@@ -219,6 +227,10 @@ fn build_signing_params<'a>(
 ) -> Result<aws_sigv4::http_request::SigningParams<'a>> {
     let mut settings = SigningSettings::default();
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    if signs_path_as_sent(service) {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
 
     Ok(v4::SigningParams::builder()
         .identity(identity)
@@ -614,8 +626,8 @@ mod tests {
         region: &str,
         service: &str,
         time: SystemTime,
-        percent_encoding_mode: aws_sigv4::http_request::PercentEncodingMode,
-        uri_path_normalization_mode: aws_sigv4::http_request::UriPathNormalizationMode,
+        percent_encoding_mode: PercentEncodingMode,
+        uri_path_normalization_mode: UriPathNormalizationMode,
     ) -> String {
         let identity = build_identity(
             "AKIAIOSFODNN7EXAMPLE",
@@ -683,8 +695,8 @@ mod tests {
                     "eu-west-2",
                     "s3",
                     time,
-                    aws_sigv4::http_request::PercentEncodingMode::Single,
-                    aws_sigv4::http_request::UriPathNormalizationMode::Disabled,
+                    PercentEncodingMode::Single,
+                    UriPathNormalizationMode::Disabled,
                 ),
                 "S3 signature for {path}"
             );
@@ -705,8 +717,8 @@ mod tests {
                 "eu-west-2",
                 "eks",
                 time,
-                aws_sigv4::http_request::PercentEncodingMode::Double,
-                aws_sigv4::http_request::UriPathNormalizationMode::Enabled,
+                PercentEncodingMode::Double,
+                UriPathNormalizationMode::Enabled,
             )
         );
     }

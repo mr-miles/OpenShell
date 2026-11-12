@@ -7,13 +7,17 @@
 //! forwards the raw request line to the upstream server. If the path the
 //! policy sees is not the path the upstream dispatches on, any path-based
 //! allow rule can be bypassed with non-canonical encodings (`..`, `%2e%2e`,
-//! `//`, `;params`). This module resolves that divergence by producing a
-//! single canonical path that is both the input to policy evaluation and
-//! the bytes written onto the wire.
+//! `//`, `;params`). This module resolves that divergence by producing one
+//! canonical segment structure that is both the input to policy evaluation
+//! and the bytes written onto the wire. The policy and wire forms differ only
+//! in reserved characters the client percent-encoded (such as `%3A`): policy
+//! sees them decoded, and the wire keeps them encoded so a client signature
+//! over the path (for example AWS SigV4) still verifies upstream.
 //!
 //! Behavior for v1:
 //! - Percent-decode unreserved path bytes; preserve the rest as uppercase
-//!   `%HH`.
+//!   `%HH` on the wire. Reserved sub-delimiters, `:`, and `@` are decoded
+//!   for policy evaluation only.
 //! - Resolve `.` and `..` segments per RFC 3986 Section 5.2.4. `..` that
 //!   would escape the root is rejected rather than silently clamped to
 //!   `/` — non-canonical input is almost always adversarial.
@@ -86,22 +90,38 @@ impl Default for CanonicalizeOptions {
 /// Result of a successful canonicalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalPath {
-    /// The canonical path. Always starts with `/`. Contains no `.`/`..`
-    /// segments, no doubled slashes, and no `;params` (when stripping is
-    /// enabled).
+    /// The canonical path policy evaluates. Always starts with `/`. Contains
+    /// no `.`/`..` segments, no doubled slashes, and no `;params` (when
+    /// stripping is enabled).
     pub path: String,
-    /// `true` if the canonical form differs from the input. Callers use
-    /// this to decide whether to rewrite the outbound request line.
+    /// The canonical path to forward upstream. It has the same segments as
+    /// `path` but keeps any reserved character the client percent-encoded
+    /// (such as `%3A` or `%40`) encoded, so the upstream receives the bytes
+    /// the client sent (and possibly signed) wherever no structural
+    /// canonicalization was needed.
+    pub wire_path: String,
+    /// `true` if `wire_path` differs from the input. Callers use this to
+    /// decide whether to rewrite the outbound request line.
     pub rewritten: bool,
 }
 
 /// Maximum accepted length of an origin-form path (bytes).
 pub(crate) const MAX_PATH_LEN: usize = 4 * 1024;
 
-/// Sentinel byte used to represent a `%2F`-decoded slash inside a segment.
-/// Chosen from the C0 control range so no legitimate decoded byte collides
-/// with it; any raw `0x01` in the input is rejected up front.
-const ENCODED_SLASH_SENTINEL: u8 = 0x01;
+/// A decoded path byte. The low 8 bits hold the byte; [`PERCENT_ENCODED`]
+/// marks a reserved byte the client percent-encoded. Marked bytes never
+/// compare equal to a literal `/`, `.`, or `;`, so an encoded slash cannot
+/// split a segment and is kept inside it.
+type PathUnit = u16;
+
+/// Flag on a [`PathUnit`] for a reserved byte that arrived percent-encoded
+/// and is re-emitted percent-encoded on the wire.
+const PERCENT_ENCODED: PathUnit = 0x100;
+const SLASH: PathUnit = 0x2F;
+const DOT: PathUnit = 0x2E;
+const SEMICOLON: PathUnit = 0x3B;
+/// A `%2F` inside a segment (only produced when `allow_encoded_slash`).
+const ENCODED_SLASH: PathUnit = PERCENT_ENCODED | SLASH;
 
 /// Canonicalize an HTTP request-target's path component.
 ///
@@ -173,17 +193,18 @@ pub fn canonicalize_request_target(
         return Err(CanonicalizeError::PathTooLong);
     }
 
-    // 8. Percent-decode the path into bytes. `%2F` is replaced by a
-    //    sentinel byte so that subsequent `/` splitting cannot confuse it
-    //    with a real path separator.
-    let decoded = percent_decode_with_sentinel(raw_path.as_bytes(), opts.allow_encoded_slash)?;
+    // 8. Percent-decode the path into units. A percent-encoded reserved
+    //    byte, including `%2F`, keeps a marker so that subsequent `/`
+    //    splitting cannot confuse it with a real path separator and so the
+    //    wire form can re-emit it encoded.
+    let decoded = percent_decode(raw_path.as_bytes(), opts.allow_encoded_slash)?;
 
     // 9. Split on literal `/`, then strip `;params` *before* resolving
     //    dot-segments. Stripping afterwards would let a `..;` segment slip
     //    past the traversal guard (it is not byte-equal to `..`) and then
     //    revert to a bare `..` during reconstruction.
     let segments = split_path_segments(&decoded);
-    let segments: Vec<&[u8]> = if opts.strip_path_parameters {
+    let segments: Vec<&[PathUnit]> = if opts.strip_path_parameters {
         segments.into_iter().map(strip_path_parameters).collect()
     } else {
         segments
@@ -193,40 +214,40 @@ pub fn canonicalize_request_target(
     // 9b. Defense in depth: no `.`/`..` may survive canonicalization. The
     //     policy engine trusts this function to have removed them, so a
     //     residual dot-segment is always a bug or an attack. This also
-    //     catches a `..` hidden behind a `%2F` sentinel on endpoints that
-    //     opted into `allow_encoded_slash`, where the sentinel keeps the
+    //     catches a `..` hidden behind a `%2F` on endpoints that opted into
+    //     `allow_encoded_slash`, where the encoded slash keeps the
     //     dot-segment inside its segment and out of `resolve_dot_segments`.
     for seg in &resolved {
-        for part in seg.split(|&b| b == ENCODED_SLASH_SENTINEL) {
-            if part == b".." || part == b"." {
+        for part in seg.split(|&unit| unit == ENCODED_SLASH) {
+            if is_dot_segment(part) {
                 return Err(CanonicalizeError::ResidualDotSegment);
             }
         }
     }
 
-    // 10. Reconstruct. Strip `;params` per segment if requested; re-encode
-    //     any byte that must be percent-encoded in the pchar set.
-    let canonical = build_canonical_path(&resolved, decoded.last().copied() == Some(b'/'), *opts);
+    // 10. Reconstruct the policy and wire forms from the same segments.
+    let (path, wire_path) = build_canonical_paths(&resolved, *opts);
 
-    let rewritten = canonical != raw_path;
+    let rewritten = wire_path != raw_path;
     Ok((
         CanonicalPath {
-            path: canonical,
+            path,
+            wire_path,
             rewritten,
         },
         query_part,
     ))
 }
 
-/// Report whether a canonical path carries a `%2F` that survived
+/// Report whether a canonical policy path carries a `%2F` that survived
 /// canonicalization.
 ///
 /// Callers that canonicalize before they know which endpoint config applies
 /// use this to re-check the result against the config that actually matched.
 ///
-/// The test is exact: [`build_canonical_path`] emits the literal `%2F` only
-/// for the encoded-slash sentinel, and percent-encodes any other `%` byte as
-/// `%25`, so no `%2F` substring can reach the output by another route.
+/// The test is exact: [`build_canonical_paths`] emits the literal `%2F` in the
+/// policy path only for an encoded slash, and percent-encodes any other `%`
+/// byte as `%25`, so no `%2F` substring can reach it by another route.
 #[must_use]
 pub fn canonical_path_has_encoded_slash(canonical_path: &str) -> bool {
     canonical_path.contains("%2F")
@@ -236,20 +257,30 @@ pub fn canonical_path_has_encoded_slash(canonical_path: &str) -> bool {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn percent_decode_with_sentinel(
+/// Reserved bytes that are emitted literally in a canonical path but keep
+/// their percent-encoding on the wire when the client sent them encoded.
+///
+/// RFC 3986 Section 6.2.2.2 permits decoding only unreserved characters
+/// during normalization; decoding a reserved character can change how the
+/// upstream interprets the path and invalidates any signature over the path
+/// bytes (for example AWS SigV4). `;` is not listed: an encoded `%3B` still
+/// decodes to a path-parameter delimiter so parameter stripping keeps
+/// closing the `..;` traversal bypass. `/` is handled separately.
+fn keeps_percent_encoding(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b'=' | b':' | b'@'
+    )
+}
+
+fn percent_decode(
     raw: &[u8],
     allow_encoded_slash: bool,
-) -> Result<Vec<u8>, CanonicalizeError> {
+) -> Result<Vec<PathUnit>, CanonicalizeError> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
         let b = raw[i];
-        if b == ENCODED_SLASH_SENTINEL {
-            // Raw sentinel byte in input — already rejected by the C0
-            // control-byte sweep above, but double-check here to avoid
-            // collisions in case the sweep is ever relaxed.
-            return Err(CanonicalizeError::NullOrControlByte);
-        }
         if b == b'%' {
             if i + 2 >= raw.len() {
                 return Err(CanonicalizeError::InvalidPercentEncoding);
@@ -262,18 +293,20 @@ fn percent_decode_with_sentinel(
                 if !allow_encoded_slash {
                     return Err(CanonicalizeError::EncodedSlashNotAllowed);
                 }
-                out.push(ENCODED_SLASH_SENTINEL);
+                out.push(ENCODED_SLASH);
             } else if decoded == 0 || decoded == 0x7F || (decoded < 0x20 && decoded != b'\t') {
                 return Err(CanonicalizeError::NullOrControlByte);
             } else if decoded == b'\n' || decoded == b'\r' || decoded == b'\t' {
                 // %-encoded CR/LF/TAB are still control bytes; reject.
                 return Err(CanonicalizeError::NullOrControlByte);
+            } else if keeps_percent_encoding(decoded) {
+                out.push(PERCENT_ENCODED | PathUnit::from(decoded));
             } else {
-                out.push(decoded);
+                out.push(PathUnit::from(decoded));
             }
             i += 3;
         } else {
-            out.push(b);
+            out.push(PathUnit::from(b));
             i += 1;
         }
     }
@@ -281,24 +314,38 @@ fn percent_decode_with_sentinel(
 }
 
 /// Drop a trailing `;params` suffix from a single path segment.
-fn strip_path_parameters(seg: &[u8]) -> &[u8] {
+fn strip_path_parameters(seg: &[PathUnit]) -> &[PathUnit] {
     seg.iter()
-        .position(|&b| b == b';')
+        .position(|&unit| unit == SEMICOLON)
         .map_or(seg, |pos| &seg[..pos])
 }
 
-fn split_path_segments(decoded: &[u8]) -> Vec<&[u8]> {
+fn split_path_segments(decoded: &[PathUnit]) -> Vec<&[PathUnit]> {
     // decoded is guaranteed to start with `/`. Skip the leading `/` and
-    // split on subsequent `/` bytes. The sentinel byte for encoded slashes
-    // never matches, so it stays inside its segment.
-    decoded[1..].split(|&b| b == b'/').collect()
+    // split on subsequent `/` bytes. An encoded slash never matches, so it
+    // stays inside its segment.
+    decoded[1..].split(|&unit| unit == SLASH).collect()
 }
 
-fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, CanonicalizeError> {
-    let mut stack: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
+fn is_dot(seg: &[PathUnit]) -> bool {
+    matches!(seg, [DOT])
+}
+
+fn is_dot_dot(seg: &[PathUnit]) -> bool {
+    matches!(seg, [DOT, DOT])
+}
+
+fn is_dot_segment(seg: &[PathUnit]) -> bool {
+    is_dot(seg) || is_dot_dot(seg)
+}
+
+fn resolve_dot_segments(
+    segments: Vec<&[PathUnit]>,
+) -> Result<Vec<Vec<PathUnit>>, CanonicalizeError> {
+    let mut stack: Vec<Vec<PathUnit>> = Vec::with_capacity(segments.len());
     let last = segments.len().saturating_sub(1);
     for (idx, seg) in segments.into_iter().enumerate() {
-        if seg == b".." {
+        if is_dot_dot(seg) {
             if stack.pop().is_none() {
                 return Err(CanonicalizeError::TraversalAboveRoot);
             }
@@ -308,7 +355,7 @@ fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, Canonicali
             }
             continue;
         }
-        if seg == b"." {
+        if is_dot(seg) {
             if idx == last {
                 stack.push(Vec::new());
             }
@@ -324,34 +371,54 @@ fn resolve_dot_segments(segments: Vec<&[u8]>) -> Result<Vec<Vec<u8>>, Canonicali
     Ok(stack)
 }
 
-fn build_canonical_path(
-    segments: &[Vec<u8>],
-    _trailing_slash_hint: bool,
+/// Rebuild the policy path and the wire path from the same resolved
+/// segments.
+///
+/// Both strip `;params` per segment if requested and percent-encode any byte
+/// outside the pchar set. They differ only for reserved bytes the client
+/// percent-encoded: the policy path decodes them (except `%2F`), while the
+/// wire path keeps them encoded.
+fn build_canonical_paths(
+    segments: &[Vec<PathUnit>],
     opts: CanonicalizeOptions,
-) -> String {
-    let mut out = String::from("/");
+) -> (String, String) {
+    let mut policy = String::from("/");
+    let mut wire = String::from("/");
     for (idx, seg) in segments.iter().enumerate() {
         if idx > 0 {
-            out.push('/');
+            policy.push('/');
+            wire.push('/');
         }
-        let trimmed: &[u8] = if opts.strip_path_parameters {
+        let trimmed: &[PathUnit] = if opts.strip_path_parameters {
             strip_path_parameters(seg)
         } else {
             seg
         };
-        for &b in trimmed {
-            if b == ENCODED_SLASH_SENTINEL {
-                out.push_str("%2F");
-            } else if is_pchar_unreserved(b) {
-                out.push(b as char);
+        for &unit in trimmed {
+            let [byte, flags] = unit.to_le_bytes();
+            if flags != 0 {
+                push_percent_encoded(&mut wire, byte);
+                if byte == b'/' {
+                    push_percent_encoded(&mut policy, byte);
+                } else {
+                    policy.push(char::from(byte));
+                }
+            } else if is_pchar_unreserved(byte) {
+                policy.push(char::from(byte));
+                wire.push(char::from(byte));
             } else {
-                out.push('%');
-                out.push(upper_hex_nibble(b >> 4));
-                out.push(upper_hex_nibble(b & 0x0F));
+                push_percent_encoded(&mut policy, byte);
+                push_percent_encoded(&mut wire, byte);
             }
         }
     }
-    out
+    (policy, wire)
+}
+
+fn push_percent_encoded(out: &mut String, byte: u8) {
+    out.push('%');
+    out.push(upper_hex_nibble(byte >> 4));
+    out.push(upper_hex_nibble(byte & 0x0F));
 }
 
 fn is_pchar_unreserved(b: u8) -> bool {
@@ -716,7 +783,7 @@ mod tests {
 
     #[test]
     fn regression_dotdot_behind_encoded_slash_is_rejected_when_opted_in() {
-        // With `allow_encoded_slash`, the `%2F` sentinel keeps the dot-segment
+        // With `allow_encoded_slash`, an encoded `%2F` keeps the dot-segment
         // inside its segment, so `resolve_dot_segments` never sees it. The
         // residual guard is what closes this.
         let opts = CanonicalizeOptions {
@@ -749,7 +816,7 @@ mod tests {
             ..CanonicalizeOptions::default()
         };
 
-        // A surviving sentinel is detected.
+        // A surviving encoded slash is detected.
         let slug = canon_with("/repos/group%2fproject/issues", opts).unwrap();
         assert_eq!(slug, "/repos/group%2Fproject/issues");
         assert!(canonical_path_has_encoded_slash(&slug));
