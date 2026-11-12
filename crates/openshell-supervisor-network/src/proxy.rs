@@ -5113,8 +5113,8 @@ fn prepare_forward_target(
         .as_deref()
         .filter(|query| !query.is_empty())
         .map_or_else(
-            || canonical.path.clone(),
-            |query| format!("{}?{query}", canonical.path),
+            || canonical.wire_path.clone(),
+            |query| format!("{}?{query}", canonical.wire_path),
         );
     Ok(PreparedForwardTarget {
         canonical_path: canonical.path,
@@ -5468,6 +5468,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn inject_token_grant_for_forward_request(
     method: &str,
+    policy_path: &str,
     upstream_target: &str,
     forward_request_bytes: Vec<u8>,
     l7_ctx: &mut crate::l7::relay::L7EvalContext,
@@ -5476,18 +5477,17 @@ async fn inject_token_grant_for_forward_request(
     observation_context: Option<&EndpointObservationContext>,
     correlation: Option<&crate::l7::correlation::RequestCorrelation>,
 ) -> Result<Vec<u8>> {
-    let (path, _) = crate::l7::rest::parse_target_query(upstream_target)?;
     let request = if correlation.is_some() {
         crate::l7::rest::request_from_buffered_http(
             method,
-            path,
+            policy_path,
             upstream_target,
             forward_request_bytes,
         )?
     } else {
         crate::l7::rest::request_from_buffered_http_unprotected(
             method,
-            path,
+            policy_path,
             upstream_target,
             forward_request_bytes,
         )?
@@ -6801,6 +6801,7 @@ async fn handle_forward_proxy_inner(
     }
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
+        middleware_path,
         &upstream_target,
         forward_request_bytes,
         &mut l7_ctx,
@@ -13146,6 +13147,7 @@ network_policies:
     ) -> Result<Vec<u8>> {
         inject_token_grant_for_forward_request(
             "GET",
+            "/v1/projects",
             "/v1/projects",
             raw,
             ctx,
