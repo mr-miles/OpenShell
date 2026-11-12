@@ -327,7 +327,7 @@ async fn parse_http_request_with_receipt_protection<C: AsyncRead + Unpin>(
         buf = rewrite_request_line_target(
             &buf,
             &method,
-            &canonical.path,
+            &canonical.wire_path,
             raw_query.as_deref(),
             version,
         )?;
