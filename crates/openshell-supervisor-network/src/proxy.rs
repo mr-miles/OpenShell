@@ -18,9 +18,7 @@ use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::correlation::{HttpOutcome, RequestStage};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
-use crate::policy_dns::{
-    MappingLookup, MappingLookupError, PolicyEndpointId, ResolvedEndpointStore,
-};
+use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::telemetry::egress_emit;
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
@@ -134,8 +132,7 @@ fn is_reserved_relay_destination(destination: SocketAddr) -> bool {
 
 use self::destination::{
     DestinationDenial, DestinationDenialKind, DestinationRequest, DestinationValidationPlan,
-    build_pinned_validation_plan, build_validation_plan, filter_resolved_addresses,
-    validate_destination,
+    build_validation_plan, validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -793,7 +790,7 @@ async fn preauthorize_transparent_open(
         ));
     }
     let TransparentTarget { host, intent } =
-        match resolve_transparent_target(destination, policy_dns_store, opa_engine) {
+        match resolve_transparent_target(destination, policy_dns_store) {
             Ok(target) => target,
             Err(error) => {
                 warn!(%destination, %error, "Denied staged transparent connection");
@@ -873,11 +870,10 @@ async fn preauthorize_transparent_open(
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
     }
-    // A synthetic destination may dial only the addresses pinned for the
-    // generation that produced this decision. Re-acquiring the mapping at that
-    // generation keeps a policy reload between correlation and authorization
-    // from falling back to resolving the name again. Observation records pin
-    // no addresses, so they never reach an upstream dial.
+    // A synthetic destination may dial only the addresses its mapping pins
+    // that this decision's destination rules permit; the name is never
+    // resolved again. Observation records pin no addresses, so they never
+    // reach an upstream dial.
     let pinned_plan = match &intent {
         None => None,
         Some(intent) => match policy_dns_store
@@ -1029,15 +1025,14 @@ fn transparent_destination_endpoint(
 /// Logical destination recovered for a staged transparent TCP open.
 struct TransparentTarget {
     host: String,
-    /// Policy DNS correlation for a synthetic destination, read at the
-    /// generation current when the open arrived. `None` outside the pools.
+    /// Policy DNS correlation for a synthetic destination. `None` outside the
+    /// pools.
     intent: Option<MappingLookup>,
 }
 
 fn resolve_transparent_target(
     destination: SocketAddr,
     policy_dns_store: Option<&Arc<ResolvedEndpointStore>>,
-    opa_engine: &OpaEngine,
 ) -> Result<TransparentTarget> {
     let Some(store) = policy_dns_store else {
         return Ok(TransparentTarget {
@@ -1048,7 +1043,6 @@ fn resolve_transparent_target(
     match store.lookup_intent(
         destination.ip(),
         destination.port(),
-        opa_engine.current_generation(),
         std::time::Instant::now(),
     ) {
         Ok(mapping) => Ok(TransparentTarget {
@@ -1065,44 +1059,27 @@ fn resolve_transparent_target(
     }
 }
 
-/// Re-acquire a policy DNS mapping at the generation that produced
-/// `decision`, select only process-authorized endpoint contracts, and apply
-/// the hydrated destination restrictions before pinning. Observation records,
-/// stale mappings, unmatched endpoints, and unmapped ports fail closed.
+/// Pin a policy DNS destination to the mapping's addresses that `decision`'s
+/// hydrated destination rules permit. The mapping may predate the policy that
+/// made the decision; only its addresses are used. Observation records,
+/// expired mappings and addresses the rules reject fail closed.
 fn pinned_transparent_plan(
     store: &ResolvedEndpointStore,
     destination: SocketAddr,
     decision: &EgressDecision,
 ) -> std::result::Result<DestinationValidationPlan, MappingLookupError> {
-    let mapping = store.lookup(
-        destination.ip(),
-        destination.port(),
-        decision.policy_generation,
-        std::time::Instant::now(),
-    )?;
-    let endpoint_ids = decision
-        .endpoint
-        .matched_endpoints
-        .iter()
-        .map(|endpoint| PolicyEndpointId {
-            policy_name: endpoint.policy_name.clone(),
-            endpoint_index: endpoint.endpoint_index,
-        })
-        .collect::<Vec<_>>();
-    let addresses = mapping.pinned_addresses_for(&endpoint_ids)?;
     let plan = decision
         .endpoint
         .destination
         .as_ref()
         .ok_or(MappingLookupError::InvalidMapping)?;
-    let addresses = filter_resolved_addresses(
-        plan,
-        mapping.record.normalized_name.as_str(),
-        destination.port(),
-        &addresses,
-    )
-    .map_err(|_| MappingLookupError::InvalidMapping)?;
-    build_pinned_validation_plan(addresses).map_err(|_| MappingLookupError::InvalidMapping)
+    store
+        .lookup(
+            destination.ip(),
+            destination.port(),
+            std::time::Instant::now(),
+        )?
+        .pinned_plan(plan)
 }
 
 fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
@@ -1145,6 +1122,7 @@ impl TransparentTcpHandle {
         activity_tx: Option<ActivitySender>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         engine_ready: tokio::sync::watch::Receiver<bool>,
+        trusted_host_gateway: Option<IpAddr>,
     ) -> Result<Self> {
         let upstream_proxy = Arc::new(
             UpstreamProxyConfig::from_args(upstream_proxy_args)
@@ -1197,6 +1175,7 @@ impl TransparentTcpHandle {
                             denial_tx,
                             activity_tx,
                             upstream_proxy,
+                            trusted_host_gateway,
                         )
                         .await
                         {
@@ -1234,23 +1213,19 @@ async fn handle_transparent_tcp_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     upstream_proxy: Arc<Option<UpstreamProxyConfig>>,
+    trusted_host_gateway: Option<IpAddr>,
 ) -> Result<()> {
     let workload_addr = client.peer_addr().into_diagnostic()?;
     let original = original_destination(&client).into_diagnostic()?;
-    let current_generation = opa_engine.current_generation();
-    let mapping = match store.lookup_intent(
-        original.ip(),
-        original.port(),
-        current_generation,
-        std::time::Instant::now(),
-    ) {
-        Ok(mapping) => mapping,
-        Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, None, error);
-            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
-            return Ok(());
-        }
-    };
+    let mapping =
+        match store.lookup_intent(original.ip(), original.port(), std::time::Instant::now()) {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                emit_transparent_mapping_denial(workload_addr, original, None, error);
+                emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+                return Ok(());
+            }
+        };
     let host = mapping.record.normalized_name.as_str().to_string();
     let port = original.port();
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, original);
@@ -1260,7 +1235,7 @@ async fn handle_transparent_tcp_connection(
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
     let parent = connect_span.clone();
-    let decision = tokio::task::spawn_blocking(move || {
+    let mut decision = tokio::task::spawn_blocking(move || {
         parent.in_scope(|| authorize_egress_intent(connection, &engine, &cache, &pid, intent))
     })
     .await
@@ -1295,41 +1270,34 @@ async fn handle_transparent_tcp_connection(
         return Ok(());
     }
 
-    let (generation_guard, connector) =
-        match pin_transparent_tcp(&store, &opa_engine, original, &decision)
-            .instrument(egress::resolve_span(&connect_span))
-            .await
-        {
-            Ok(pinned) => pinned,
-            Err(TransparentPinRefusal::Mapping(error)) => {
-                emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
-                emit_activity(&activity_tx, true, "transparent_tcp_mapping");
-                return Ok(());
-            }
-            Err(TransparentPinRefusal::Uncorrelated) => {
-                let reason = "authorized endpoint did not match DNS correlation";
-                emit_transparent_policy_denial(&decision, workload_addr, &host, port);
-                emit_denial(
-                    &denial_tx,
-                    &host,
-                    port,
-                    decision
-                        .binary
-                        .as_ref()
-                        .map_or("-", |path| path.to_str().unwrap_or("-")),
-                    &decision,
-                    reason,
-                    "transparent-tcp",
-                );
-                emit_activity(&activity_tx, true, "transparent_tcp_policy");
-                return Ok(());
-            }
-            Err(TransparentPinRefusal::InvalidPin(error)) => {
-                return Err(miette::miette!(
-                    "transparent TCP pinned destination is invalid: {error}"
-                ));
-            }
-        };
+    let (generation_guard, connector) = match pin_transparent_tcp(
+        &store,
+        &opa_engine,
+        trusted_host_gateway,
+        original,
+        &mut decision,
+    )
+    .instrument(egress::resolve_span(&connect_span))
+    .await
+    {
+        Ok(pinned) => pinned,
+        Err(TransparentPinRefusal::Destination(denial)) => {
+            warn!(%original, reason = %denial.reason, "Denied transparent TCP destination");
+            emit_transparent_mapping_denial(
+                workload_addr,
+                original,
+                Some(&host),
+                MappingLookupError::InvalidMapping,
+            );
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+        Err(TransparentPinRefusal::Mapping(error)) => {
+            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
+            emit_activity(&activity_tx, true, "transparent_tcp_mapping");
+            return Ok(());
+        }
+    };
     let mut ctx = relay::http_context(
         &decision,
         None,
@@ -1534,59 +1502,50 @@ fn original_destination(stream: &TcpStream) -> std::io::Result<SocketAddr> {
 }
 
 /// Why [`pin_transparent_tcp`] refused an authorized connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum TransparentPinRefusal {
+    /// The deciding endpoint's destination rules could not be built.
+    Destination(DestinationDenial),
     /// The policy DNS mapping cannot pin the connection.
     Mapping(MappingLookupError),
-    /// No endpoint that authorized the connection is in the mapping.
-    Uncorrelated,
-    /// The pinned destination failed validation.
-    InvalidPin(MappingLookupError),
 }
 
 /// Pin a transparent TCP connection to `original` that `decision` allowed:
-/// hold the decision's policy generation and build the connector from the
-/// policy DNS mapping.
+/// hydrate the decision's destination rules the way policy DNS built them for
+/// the name, hold the decision's policy generation, and build the connector
+/// from the mapping's addresses those rules permit. The name is never
+/// resolved again.
 ///
-/// Authorization may race a policy reload. Re-pin the exact generation that
-/// produced the decision, then reacquire the DNS mapping against that
-/// generation before correlating endpoint identity or constructing a
-/// connector. This prevents combining an old DNS answer with a newer policy
-/// decision (or vice versa).
+/// Authorization may race a policy reload: the generation guard is checked
+/// again before dialing.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn pin_transparent_tcp(
     store: &ResolvedEndpointStore,
     opa_engine: &Arc<OpaEngine>,
+    trusted_host_gateway: Option<IpAddr>,
     original: SocketAddr,
-    decision: &EgressDecision,
+    decision: &mut EgressDecision,
 ) -> std::result::Result<
     (PolicyGenerationGuard, destination::UpstreamConnector),
     TransparentPinRefusal,
 > {
-    let generation_guard = relay::pin_policy_generation(opa_engine, decision, None)
-        .map_err(|_| TransparentPinRefusal::Mapping(MappingLookupError::StalePolicy))?;
-    let mapping = store
-        .lookup(
-            original.ip(),
-            original.port(),
-            decision.policy_generation,
-            std::time::Instant::now(),
-        )
-        .map_err(TransparentPinRefusal::Mapping)?;
-    let endpoint_id = decision
+    hydrate_destination_plan(decision, trusted_host_gateway, None)
+        .map_err(TransparentPinRefusal::Destination)?;
+    let plan = decision
         .endpoint
-        .matched_endpoints
-        .iter()
-        .map(|endpoint| PolicyEndpointId {
-            policy_name: endpoint.policy_name.clone(),
-            endpoint_index: endpoint.endpoint_index,
-        })
-        .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate))
-        .ok_or(TransparentPinRefusal::Uncorrelated)?;
-    let connector = mapping
-        .connector_for(&endpoint_id)
+        .destination
+        .clone()
+        .ok_or(TransparentPinRefusal::Mapping(
+            MappingLookupError::InvalidMapping,
+        ))?;
+    let generation_guard = relay::pin_policy_generation(opa_engine, decision, None)
+        .map_err(|_| TransparentPinRefusal::Mapping(MappingLookupError::PolicyChanged))?;
+    let connector = store
+        .lookup(original.ip(), original.port(), std::time::Instant::now())
+        .map_err(TransparentPinRefusal::Mapping)?
+        .connector_for(&plan)
         .await
-        .map_err(TransparentPinRefusal::InvalidPin)?;
+        .map_err(TransparentPinRefusal::Mapping)?;
     Ok((generation_guard, connector))
 }
 
@@ -1600,8 +1559,7 @@ fn emit_transparent_mapping_denial(
     let detail = match error {
         MappingLookupError::Missing => "transparent_tcp_mapping_missing",
         MappingLookupError::Expired => "transparent_tcp_mapping_expired",
-        MappingLookupError::StalePolicy => "transparent_tcp_mapping_stale_policy",
-        MappingLookupError::PortMismatch => "transparent_tcp_port_mismatch",
+        MappingLookupError::PolicyChanged => "transparent_tcp_mapping_stale_policy",
         MappingLookupError::EndpointMismatch
         | MappingLookupError::InvalidMapping
         | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
@@ -2693,12 +2651,7 @@ async fn handle_mediated_connection(
                 policy_local_transparent = true;
                 (None, None, None)
             } else {
-                let host = resolve_transparent_target(
-                    destination,
-                    policy_dns_store.as_ref(),
-                    &opa_engine,
-                )?
-                .host;
+                let host = resolve_transparent_target(destination, policy_dns_store.as_ref())?.host;
                 let (decision, connector) = transparent
                     .authorization
                     .map_or((None, None), |(decision, connector)| {
@@ -8222,8 +8175,6 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     fn publish_mapping(
         store: &ResolvedEndpointStore,
         name: &str,
-        policy_name: &str,
-        port: u16,
         generation: u64,
     ) -> crate::policy_dns::ResolvedEndpointRecord {
         store
@@ -8231,21 +8182,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 crate::policy_dns::PublishRequest {
                     normalized_name: crate::policy_dns::NormalizedName::parse(name).unwrap(),
                     family: crate::policy_dns::AddressFamily::Ipv4,
-                    allocation_identity: [1; 32],
                     policy_generation: generation,
                     ttl: std::time::Duration::from_secs(30),
-                    contracts: vec![crate::policy_dns::ResolvedPortContract {
-                        endpoint_id: PolicyEndpointId {
-                            policy_name: policy_name.to_string(),
-                            endpoint_index: 0,
-                        },
-                        port,
-                        destination_plan: DestinationValidationPlan {
-                            address_authorization:
-                                destination::AddressAuthorization::ExactDeclaredHost,
-                        },
-                        pinned_addresses: vec!["203.0.113.8".parse().unwrap()],
-                    }],
+                    pinned_addresses: vec!["203.0.113.8".parse().unwrap()],
                 },
                 generation,
                 std::time::Instant::now(),
@@ -8480,13 +8419,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         )
         .unwrap();
         let store = policy_dns_test_store();
-        let record = publish_mapping(
-            &store,
-            "db.example",
-            "database",
-            5432,
-            engine.current_generation(),
-        );
+        let record = publish_mapping(&store, "db.example", engine.current_generation());
         let (open, completion) = staged_curl_open(
             SocketAddr::new(record.synthetic_address, 5432),
             engine.current_generation(),
@@ -8536,8 +8469,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 "host: '*.service.example'",
                 "host: db.service.example, advisor_proposed: true",
             ] {
-                // No contract for the caller, mixed pins in its contract, a
-                // compatible union, explicit narrow permission, and no usable pin.
+                // Only a private pin, mixed pins, two public pins, explicit
+                // narrow permission, a private pin again, and a caller that is
+                // also the exact-host binary.
                 for case in 0..6 {
                     let allowed_ips = if case == 3 {
                         format!(", allowed_ips: ['{private}']")
@@ -8573,35 +8507,13 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                     )
                     .unwrap();
                     let store = policy_dns_test_store();
-                    let contract = |policy_name: &str, endpoint_index, addresses: Vec<IpAddr>| {
-                        crate::policy_dns::ResolvedPortContract {
-                            endpoint_id: PolicyEndpointId {
-                                policy_name: policy_name.to_string(),
-                                endpoint_index,
-                            },
-                            port: 5432,
-                            destination_plan: DestinationValidationPlan {
-                                address_authorization:
-                                    destination::AddressAuthorization::ExactDeclaredHost,
-                            },
-                            pinned_addresses: addresses,
-                        }
+                    // The mapping pins every address some endpoint of the
+                    // name permitted; the caller's own rules select from them.
+                    let pinned_addresses = match case {
+                        0 | 4 => vec![private],
+                        2 => vec![private, public, second_public],
+                        _ => vec![private, public],
                     };
-                    let mut contracts = vec![contract("other_binary", 0, vec![private])];
-                    if case != 0 {
-                        contracts.push(contract(
-                            "caller",
-                            0,
-                            if case == 4 {
-                                vec![private]
-                            } else {
-                                vec![private, public]
-                            },
-                        ));
-                    }
-                    if case == 2 {
-                        contracts.push(contract("caller", 1, vec![second_public]));
-                    }
                     let record = store
                         .publish(
                             crate::policy_dns::PublishRequest {
@@ -8610,10 +8522,9 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
                                 )
                                 .unwrap(),
                                 family,
-                                allocation_identity: [1; 32],
                                 policy_generation: engine.current_generation(),
                                 ttl: std::time::Duration::from_secs(30),
-                                contracts,
+                                pinned_addresses,
                             },
                             engine.current_generation(),
                             std::time::Instant::now(),
@@ -8748,13 +8659,7 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         // The same policy admits curl to pypi.org:80 through a mapping with
         // an endpoint contract.
         let mapped_store = policy_dns_test_store();
-        let mapped = publish_mapping(
-            &mapped_store,
-            "pypi.org",
-            "pypi",
-            80,
-            engine.current_generation(),
-        );
+        let mapped = publish_mapping(&mapped_store, "pypi.org", engine.current_generation());
         assert_eq!(
             preauthorize(mapped_store, SocketAddr::new(mapped.synthetic_address, 80)).await,
             (true, TcpOpenDecision::RelayReady)
@@ -8780,21 +8685,17 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         );
     }
 
+    /// The pinned plan uses only the mapping's addresses, whichever policy
+    /// generation decided the connection, and never resolves the name again.
     #[test]
-    fn pinned_plan_requires_the_mapping_of_the_deciding_generation() {
+    fn pinned_plan_uses_only_the_mapping_whichever_generation_decided() {
         let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
         .unwrap();
         let store = policy_dns_test_store();
-        let mapped = publish_mapping(
-            &store,
-            "db.example",
-            "database",
-            5432,
-            engine.current_generation(),
-        );
+        let mapped = publish_mapping(&store, "db.example", engine.current_generation());
         let observed = publish_observation(&store, "pypi.org", engine.current_generation());
         let (open, _) = staged_curl_open(
             SocketAddr::new(mapped.synthetic_address, 5432),
@@ -8811,21 +8712,27 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             decision
         };
         let mapped_destination = SocketAddr::new(mapped.synthetic_address, 5432);
+        let pinned = DestinationValidationPlan {
+            address_authorization: destination::AddressAuthorization::PinnedResolved(vec![
+                "203.0.113.8".parse().unwrap(),
+            ]),
+        };
 
-        pinned_transparent_plan(&store, mapped_destination, &decide("db.example", 5432))
-            .expect("the deciding generation pins its addresses");
+        assert_eq!(
+            pinned_transparent_plan(&store, mapped_destination, &decide("db.example", 5432)),
+            Ok(pinned.clone())
+        );
         assert!(matches!(
             pinned_transparent_plan(
                 &store,
                 SocketAddr::new(observed.synthetic_address, 80),
                 &decide("pypi.org", 80),
             ),
-            Err(MappingLookupError::PortMismatch)
+            Err(MappingLookupError::EndpointMismatch)
         ));
 
         // A reload between DNS correlation and authorization yields a decision
-        // from a newer generation than the DNS answer. It must not fall back
-        // to resolving the name again.
+        // from a newer generation than the DNS answer.
         engine
             .reload(
                 include_str!("../data/sandbox-policy.rego"),
@@ -8833,11 +8740,12 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             )
             .unwrap();
         let reloaded = decide("db.example", 5432);
+        assert!(reloaded.policy_generation > mapped.policy_generation);
         assert!(matches!(reloaded.action, NetworkAction::Allow { .. }));
-        assert!(matches!(
+        assert_eq!(
             pinned_transparent_plan(&store, mapped_destination, &reloaded),
-            Err(MappingLookupError::StalePolicy)
-        ));
+            Ok(pinned)
+        );
     }
 
     /// Whether a staged curl open to `destination` is admitted, and the
@@ -8872,11 +8780,12 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         store: &Arc<ResolvedEndpointStore>,
         engine: &Arc<OpaEngine>,
         destination: SocketAddr,
+        trusted_host_gateway: Option<IpAddr>,
     ) -> std::result::Result<Vec<SocketAddr>, String> {
-        let target = resolve_transparent_target(destination, Some(store), engine)
+        let target = resolve_transparent_target(destination, Some(store))
             .map_err(|error| error.to_string())?;
         let (open, _) = staged_curl_open(destination, engine.current_generation());
-        let decision = authorize_supplied_identity(
+        let mut decision = authorize_supplied_identity(
             engine,
             &BinaryIdentityCache::new(),
             EgressIntent::transparent_tcp(target.host, destination.port()),
@@ -8885,10 +8794,16 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
         if let NetworkAction::Deny { reason } = &decision.action {
             return Err(format!("policy denied: {reason}"));
         }
-        pin_transparent_tcp(store, engine, destination, &decision)
-            .await
-            .map(|(_, connector)| connector.addrs().to_vec())
-            .map_err(|refusal| format!("{refusal:?}"))
+        pin_transparent_tcp(
+            store,
+            engine,
+            trusted_host_gateway,
+            destination,
+            &mut decision,
+        )
+        .await
+        .map(|(_, connector)| connector.addrs().to_vec())
+        .map_err(|refusal| format!("{refusal:?}"))
     }
 
     /// curl's policy decision for a transparent TCP connection to `host`.
@@ -8945,7 +8860,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .unwrap();
 
         assert_eq!(
-            direct_connector(&store, &engine, SocketAddr::new(answer.address, 5432)).await,
+            direct_connector(&store, &engine, SocketAddr::new(answer.address, 5432), None).await,
             Ok(vec!["8.8.8.8:5432".parse().unwrap()])
         );
     }
@@ -8958,15 +8873,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let rego = include_str!("../data/sandbox-policy.rego");
         let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
         let store = policy_dns_test_store();
-        let mapped = publish_mapping(
-            &store,
-            "db.example",
-            "database",
-            5432,
-            engine.current_generation(),
-        );
+        let mapped = publish_mapping(&store, "db.example", engine.current_generation());
         let destination = SocketAddr::new(mapped.synthetic_address, 5432);
-        let decision = direct_decision(&engine, "db.example", 5432);
+        let mut decision = direct_decision(&engine, "db.example", 5432);
         assert!(matches!(decision.action, NetworkAction::Allow { .. }));
         engine
             .reload(
@@ -8974,12 +8883,12 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
             )
             .unwrap();
-        let (guard, _) = pin_transparent_tcp(&store, &engine, destination, &decision)
+        let (guard, _) = pin_transparent_tcp(&store, &engine, None, destination, &mut decision)
             .await
             .expect("an unrelated reload is followed");
         assert_eq!(guard.captured_generation(), engine.current_generation());
 
-        let decision = direct_decision(&engine, "db.example", 5432);
+        let mut decision = direct_decision(&engine, "db.example", 5432);
         let moved =
             POLICY_DNS_OPEN_POLICY.replace("db.example, port: 5432", "db.example, port: 5433");
         assert_ne!(moved, POLICY_DNS_OPEN_POLICY);
@@ -8987,7 +8896,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             .reload(rego, &policy_with_native_executable_paths(&moved))
             .unwrap();
         assert!(matches!(
-            pin_transparent_tcp(&store, &engine, destination, &decision).await,
+            pin_transparent_tcp(&store, &engine, None, destination, &mut decision).await,
             Err(TransparentPinRefusal::Mapping(_))
         ));
     }
@@ -9004,20 +8913,15 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             pin_transparent_tcp(
                 &store,
                 &engine,
+                None,
                 SocketAddr::new(observed.synthetic_address, 80),
-                &direct_decision(&engine, "pypi.org", 80),
+                &mut direct_decision(&engine, "pypi.org", 80),
             )
             .await,
             Err(TransparentPinRefusal::Mapping(_))
         ));
 
-        let mapped = publish_mapping(
-            &store,
-            "db.example",
-            "database",
-            5432,
-            engine.current_generation(),
-        );
+        let mapped = publish_mapping(&store, "db.example", engine.current_generation());
         store
             .expire(std::time::Instant::now() + std::time::Duration::from_secs(31))
             .unwrap();
@@ -9025,8 +8929,9 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             pin_transparent_tcp(
                 &store,
                 &engine,
+                None,
                 SocketAddr::new(mapped.synthetic_address, 5432),
-                &direct_decision(&engine, "db.example", 5432),
+                &mut direct_decision(&engine, "db.example", 5432),
             )
             .await,
             Err(TransparentPinRefusal::Mapping(MappingLookupError::Expired))
@@ -9040,19 +8945,14 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let rego = include_str!("../data/sandbox-policy.rego");
         let engine = Arc::new(native_identity_engine(rego, POLICY_DNS_OPEN_POLICY).unwrap());
         let store = policy_dns_test_store();
-        let mapped = publish_mapping(
-            &store,
-            "db.example",
-            "database",
-            5432,
-            engine.current_generation(),
-        );
-        let decision = direct_decision(&engine, "db.example", 5432);
+        let mapped = publish_mapping(&store, "db.example", engine.current_generation());
+        let mut decision = direct_decision(&engine, "db.example", 5432);
         let (guard, connector) = pin_transparent_tcp(
             &store,
             &engine,
+            None,
             SocketAddr::new(mapped.synthetic_address, 5432),
-            &decision,
+            &mut decision,
         )
         .await
         .unwrap();
@@ -9428,7 +9328,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let kept = keep_pypi_answer_across(&engine, &store, &reordered).await;
 
         assert_eq!(
-            direct_connector(&store, &engine, SocketAddr::new(kept, 80)).await,
+            direct_connector(&store, &engine, SocketAddr::new(kept, 80), None).await,
             Ok(vec!["8.8.8.8:80".parse().unwrap()])
         );
     }
@@ -9447,7 +9347,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         let kept = keep_pypi_answer_across(&engine, &store, &restricted).await;
 
         assert!(
-            direct_connector(&store, &engine, SocketAddr::new(kept, 80))
+            direct_connector(&store, &engine, SocketAddr::new(kept, 80), None)
                 .await
                 .is_err()
         );
@@ -9474,7 +9374,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         .await;
 
         assert_eq!(
-            direct_connector(&store, &engine, SocketAddr::new(kept, 8080)).await,
+            direct_connector(&store, &engine, SocketAddr::new(kept, 8080), Some(gateway)).await,
             Ok(vec![SocketAddr::new(gateway, 8080)])
         );
     }
@@ -9562,7 +9462,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination)
             )
         );
-        let target = resolve_transparent_target(cached, Some(&store), &engine)
+        let target = resolve_transparent_target(cached, Some(&store))
             .expect("the kept answer still names pypi.org");
         assert_eq!(target.host, "pypi.org");
         let (open, _) = staged_curl_open(cached, engine.current_generation());
